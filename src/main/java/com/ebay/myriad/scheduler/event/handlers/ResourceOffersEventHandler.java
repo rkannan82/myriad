@@ -15,10 +15,7 @@
  */
 package com.ebay.myriad.scheduler.event.handlers;
 
-import com.ebay.myriad.scheduler.NMProfile;
-import com.ebay.myriad.scheduler.SchedulerUtils;
-import com.ebay.myriad.scheduler.TaskFactory;
-import com.ebay.myriad.scheduler.TaskUtils;
+import com.ebay.myriad.scheduler.*;
 import com.ebay.myriad.scheduler.event.ResourceOffersEvent;
 import com.ebay.myriad.state.NodeTask;
 import com.ebay.myriad.state.SchedulerState;
@@ -50,6 +47,9 @@ public class ResourceOffersEventHandler implements
 
     @Inject
     private TaskUtils taskUtils;
+
+    @Inject
+    private YarnNodeCapacityManager yarnNodeCapacityManager;
 
     @Override
     public void onEvent(ResourceOffersEvent event, long sequence,
@@ -103,10 +103,7 @@ public class ResourceOffersEventHandler implements
                     }
                 }
             } else {
-                LOGGER.info("No pending tasks, declining all offers");
-                for (Offer offer : offers) {
-                    driver.declineOffer(offer.getId());
-                }
+                yarnNodeCapacityManager.addResourceOffers(offers);
             }
         } finally {
             driverOperationLock.unlock();

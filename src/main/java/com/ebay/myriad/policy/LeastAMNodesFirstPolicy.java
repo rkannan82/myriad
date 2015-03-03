@@ -80,7 +80,7 @@ public class LeastAMNodesFirstPolicy extends BaseInterceptor implements NodeScal
     }
 
     @Override
-    public void onEventHandled(SchedulerEvent event) {
+    public void afterSchedulerEventHandled(SchedulerEvent event) {
         switch (event.getType()) {
             case NODE_UPDATE:
                 onNodeUpdated((NodeUpdateSchedulerEvent) event);

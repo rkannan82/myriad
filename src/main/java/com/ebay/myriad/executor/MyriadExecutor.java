@@ -1,6 +1,7 @@
 package com.ebay.myriad.executor;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
 import org.apache.mesos.Executor;
 import org.apache.mesos.ExecutorDriver;
 import org.apache.mesos.MesosExecutorDriver;
@@ -214,7 +215,17 @@ public class MyriadExecutor implements Executor {
 
     @Override
     public void frameworkMessage(ExecutorDriver driver, byte[] data) {
-        System.out.println("Framework message received: " + new String(data));
+        try {
+            ContainerTaskStatusRequest request = GSON.fromJson(new String(data), ContainerTaskStatusRequest.class);
+            Builder statusBuilder = TaskStatus.newBuilder()
+                .setTaskId(TaskID.newBuilder().setValue(request.getMesosTaskId()))
+                .setState(TaskState.valueOf(request.getState()));
+            driver.sendStatusUpdate(statusBuilder.build());
+            System.out.println("Sent out status update for task id: " +
+                request.getMesosTaskId() + ", status: " + request.getState());
+        } catch (JsonSyntaxException jse) {
+            jse.printStackTrace(); // spit it out to stderr
+        }
     }
 
     @Override
