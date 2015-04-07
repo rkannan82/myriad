@@ -33,20 +33,27 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
     private static final Logger LOGGER = LoggerFactory.getLogger(YarnNodeCapacityManager.class);
     private final AbstractYarnScheduler yarnScheduler;
     private final MyriadDriver myriadDriver;
+    private final TaskFactory taskFactory;
 
     // TODO(Santosh): Define a single class that encapsulates (Offer, SchedulerNode, containersBeforeHB)
     private Map<String, Protos.Offer> offersMap = new ConcurrentHashMap<>(200, 0.75f, 50);
     private Map<String, SchedulerNode> schedulerNodes = new ConcurrentHashMap<>(200, 0.75f, 50);
     private Map<NodeId, Set<RMContainer>> containersBeforeHB = new ConcurrentHashMap<>(200, 0.75f, 50);
     private Map<String, Protos.SlaveID> slaves = new ConcurrentHashMap<>(200, 0.75f, 50);
+    // cache the ExecutorInfos that were used to launch MyriadExecutor
+    private Map<Protos.SlaveID, Protos.ExecutorInfo> executorInfos = new ConcurrentHashMap<>(200, 0.75f, 50);
 
     @Inject
-    public YarnNodeCapacityManager(InterceptorRegistry registry, AbstractYarnScheduler yarnScheduler, MyriadDriver myriadDriver) {
+    public YarnNodeCapacityManager(InterceptorRegistry registry,
+                                   AbstractYarnScheduler yarnScheduler,
+                                   MyriadDriver myriadDriver,
+                                   TaskFactory taskFactory) {
         if (registry != null) {
             registry.register(this);
         }
         this.yarnScheduler = yarnScheduler;
         this.myriadDriver = myriadDriver;
+        this.taskFactory = taskFactory;
     }
 
     public void addResourceOffers(List<Protos.Offer> offers) {
@@ -54,7 +61,15 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
             if (schedulerNodes.containsKey(offer.getHostname())) {
                 offersMap.put(offer.getHostname(), offer);
                 slaves.put(offer.getHostname(), offer.getSlaveId());
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("addResourceOffers: caching offer for host {}, offer id {}",
+                        offer.getHostname(), offer.getId().getValue());
+                }
             } else {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("addResourceOffers: declining offer for host {} as NM didn't register yet",
+                        offer.getHostname());
+                }
                 myriadDriver.getDriver().declineOffer(offer.getId());
             }
         }
@@ -70,8 +85,11 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
                 // container statuses, which, capacity/fifo schedulers seem to handle
                 // (perhaps due to work preserving NM restart).
                 RMNode addedRMNode = context.getRMNodes().get(event.getNodeId());
+                ResourceOption resourceOption = addedRMNode.getResourceOption();
+                resourceOption.getResource().setVirtualCores(0);
+                resourceOption.getResource().setMemory(0);
                 addedRMNode.setResourceOption(
-                    ResourceOption.newInstance(Resource.newInstance(0, 0),
+                    ResourceOption.newInstance(resourceOption.getResource(),
                         RMNode.OVER_COMMIT_TIMEOUT_MILLIS_DEFAULT));
             }
             break;
@@ -118,11 +136,16 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
                 // this may take the capacity to negative if mesos offer is zero. it is ok
                 // because when we set this 'new node capacity' into RMNode, the scheduler first
                 // picks the negative value, then adds the 'nmFreed' resources to the node capacity.
-                // So, finally after processing this HB, the capacity of the node as known by the scheduler
+                // So, finally after processing this HB, the capacity of the node as perceived by the YARN scheduler
                 // will be equal to 'nmUnderUse'.
                 Resource nmNewCapacity = Resources.subtract(Resources.add(nmUnderUse, mesosOffer), nmFreed);
-                rmNode.setResourceOption(ResourceOption.newInstance(
-                    nmNewCapacity, RMNode.OVER_COMMIT_TIMEOUT_MILLIS_DEFAULT));
+                ResourceOption currentResourceOption = rmNode.getResourceOption();
+                currentResourceOption.getResource().setVirtualCores(nmNewCapacity.getVirtualCores());
+                currentResourceOption.getResource().setMemory(nmNewCapacity.getMemory());
+                rmNode.setResourceOption(
+                    ResourceOption.newInstance(currentResourceOption.getResource(),
+                        RMNode.OVER_COMMIT_TIMEOUT_MILLIS_DEFAULT));
+
                 containersBeforeHB.put(rmNode.getNodeID(), new HashSet<>(
                     schedulerNode.getRunningContainers()));
 
@@ -146,6 +169,7 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
                     LOGGER.warn("Duplicate node being added. Host: {}", host);
                 }
                 schedulerNodes.put(host, yarnScheduler.getSchedulerNode(nodeAddedEvent.getAddedRMNode().getNodeID()));
+                LOGGER.info("(afterSchedulerEventHandled: NM registration from node {}", host);
             }
             break;
 
@@ -163,11 +187,12 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
                 if (containersAllocatedDueToMesosOffer.isEmpty()) {
                     if (offer != null) {
                         myriadDriver.getDriver().declineOffer(offer.getId());
+                        offersMap.remove(host);
                     }
                 } else {
                     List<Protos.TaskInfo> tasks = Lists.newArrayList();
                     for (RMContainer newContainer : containersAllocatedDueToMesosOffer) {
-                        tasks.add(getTaskInfoForContainer(newContainer, offer.getSlaveId()));
+                        tasks.add(getTaskInfoForContainer(newContainer, offer));
                     }
                     myriadDriver.getDriver().launchTasks(offer.getId(), tasks);
                     if (LOGGER.isDebugEnabled()) {
@@ -183,9 +208,8 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
     }
 
     /** sends a request to executor on the given slave to send back a status update
-     * for the task launched for this container.
+     * for the mesos task launched for this container.
      *
-     * TODO(Santosh): An aux-service on the NM might be a better way to do this.
      *
      * @param slaveId
      * @param containerId
@@ -210,29 +234,55 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
     }
 
     private Resource getResourceFromOffer(Protos.Offer offer) {
-        int cpus = 0;
-        int mem = 0;
+        double cpus = 0.0;
+        double mem = 0.0;
         if (offer != null) {
             for (Protos.Resource resource : offer.getResourcesList()) {
                 if (resource.getName().equalsIgnoreCase("cpus")) {
-                    cpus += Math.round(resource.getScalar().getValue());
+                    cpus += resource.getScalar().getValue();
                 } else if (resource.getName().equalsIgnoreCase("mem")) {
-                    mem += Math.round(resource.getScalar().getValue());
+                    mem += resource.getScalar().getValue();
                 }
             }
         }
-        return Resource.newInstance(mem, cpus);
+        return Resource.newInstance((int) mem, (int) cpus);
     }
 
-    private Protos.TaskInfo getTaskInfoForContainer(RMContainer rmContainer, Protos.SlaveID slaveId) {
+    private Protos.TaskInfo getTaskInfoForContainer(RMContainer rmContainer, Protos.Offer offer) {
         Container container = rmContainer.getContainer();
         Protos.TaskID taskId = Protos.TaskID.newBuilder()
             .setValue(ContainerTaskStatusRequest.YARN_CONTAINER_TASK_ID_PREFIX + container.getId().toString()).build();
 
+        if (LOGGER.isDebugEnabled()) {
+            double offerCpu = 0.0, offerMemory = 0.0;
+            for (Protos.Resource resource : offer.getResourcesList()) {
+                if (resource.getName().equals("cpus")) {
+                    offerCpu = resource.getScalar().getValue();
+                } else if (resource.getName().equals("mem")) {
+                    offerMemory = resource.getScalar().getValue();
+                }
+            }
+            LOGGER.debug("Launching Container {} with cpu: {}, mem: {} on slave {} for offer with cpu: {}, mem: {}",
+                container.getId(),
+                container.getResource().getVirtualCores(),
+                container.getResource().getMemory(),
+                offer.getHostname(),
+                offerCpu,
+                offerMemory);
+        }
+
+        Protos.ExecutorInfo executorInfo = executorInfos.get(offer.getSlaveId());
+        if (executorInfo == null) {
+            executorInfo = Protos.ExecutorInfo.newBuilder(
+                taskFactory.getExecutorInfoForSlave(offer.getSlaveId()))
+                .setFrameworkId(offer.getFrameworkId()).build();
+            executorInfos.put(offer.getSlaveId(), executorInfo);
+        }
+
         return Protos.TaskInfo.newBuilder()
-            .setName("task " + taskId.getValue())
+            .setName("task_" + taskId.getValue())
             .setTaskId(taskId)
-            .setSlaveId(slaveId)
+            .setSlaveId(offer.getSlaveId())
             .addResources(Protos.Resource.newBuilder()
                 .setName("cpus")
                 .setType(Protos.Value.Type.SCALAR)
@@ -241,7 +291,7 @@ public class YarnNodeCapacityManager extends BaseInterceptor {
                 .setName("mem")
                 .setType(Protos.Value.Type.SCALAR)
                 .setScalar(Protos.Value.Scalar.newBuilder().setValue(container.getResource().getMemory())))
-//            .setExecutor(Protos.ExecutorInfo.newBuilder(nmExecutorInfo))
+            .setExecutor(executorInfo)
             .build();
     }
 }

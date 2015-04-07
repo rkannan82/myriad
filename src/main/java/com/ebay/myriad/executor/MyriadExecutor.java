@@ -100,6 +100,15 @@ public class MyriadExecutor implements Executor {
 
     @Override
     public void launchTask(final ExecutorDriver driver, final TaskInfo task) {
+        // "task id beginning with "yarn" is a mesos task for yarn container
+        if (task.getTaskId().getValue().startsWith("yarn")) {
+            TaskStatus status = TaskStatus.newBuilder().setTaskId(task.getTaskId())
+                .setState(TaskState.TASK_RUNNING).build();
+            driver.sendStatusUpdate(status);
+            return;
+        }
+
+        // Launch NM as a task and return status to framework
         new Thread(new Runnable() {
             public void run() {
                 Builder statusBuilder = TaskStatus.newBuilder().setTaskId(
@@ -215,6 +224,9 @@ public class MyriadExecutor implements Executor {
 
     @Override
     public void frameworkMessage(ExecutorDriver driver, byte[] data) {
+        // TODO(Santosh): Currently ContainerTaskStatusRequest is the only
+        // message a framework sends to the executor.
+        // Change this to handle other types of framework->executor messages.
         try {
             ContainerTaskStatusRequest request = GSON.fromJson(new String(data), ContainerTaskStatusRequest.class);
             Builder statusBuilder = TaskStatus.newBuilder()
